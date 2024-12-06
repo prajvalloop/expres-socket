@@ -14,9 +14,7 @@ const { Readable } = require('stream');
 const OpenAI = require('openai');
 const { PutObjectCommand, S3Client } = require('@aws-sdk/client-s3');
 dotenv.config();
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+
 const s3 = new S3Client({
   credentials: {
     accessKeyId: process.env.ACCESS_KEY,
@@ -62,8 +60,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('process-video', async (data) => {
+   
     console.log('Processing', data);
-
+    const openai = new OpenAI({
+      apiKey: data.API_KEY,
+    });
     // Close the writeStream to ensure all data is flushed
     if (writeStream) {
       writeStream.end();
@@ -103,6 +104,7 @@ io.on('connection', (socket) => {
             fs.stat('temp_upload/' + data.filename, async (err, stat) => {
               if (!err) {
                 if (stat.size < 25000000) {
+                  try{
                   const transcription =
                     await openai.audio.transcriptions.create({
                       file: fs.createReadStream(
@@ -144,8 +146,11 @@ io.on('connection', (socket) => {
                       );
                     }
                   }
+                }catch(error){
+                  console.log('Error in API_KEY OR transcribing')
                 }
               }
+            }
             });
           }
           const stopProcessing = await axios.post(
