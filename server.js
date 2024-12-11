@@ -1,6 +1,3 @@
-
-
-
 const cors = require('cors');
 const express = require('express');
 const app = express();
@@ -10,9 +7,9 @@ const dotenv = require('dotenv');
 const axios = require('axios');
 const fs = require('fs');
 const { Readable } = require('stream');
-
 const OpenAI = require('openai');
 const { PutObjectCommand, S3Client } = require('@aws-sdk/client-s3');
+
 dotenv.config();
 
 const s3 = new S3Client({
@@ -36,56 +33,55 @@ const io = new Server(server, {
 io.on('connection', (socket) => {
   console.log('Socket is connected');
 
-  // Create a unique storage for each client
-  let recordedChunks = [];
   let writeStream = null;
 
-  socket.on('video-chunks', async (data) => {
-    console.log('Video chunk is set');
+  socket.on('video-chunks', (data) => {
+    console.log('Video chunk received');
 
-    // Initialize writeStream when the first chunk arrives
     if (!writeStream) {
-      writeStream = fs.createWriteStream('temp_upload/' + data.filename);
+      writeStream = fs.createWriteStream(`temp_upload/${data.filename}`);
     }
 
-    // Append the chunk to the file
     const buffer = Buffer.from(new Uint8Array(data.chunks));
-    writeStream.write(buffer, (err) => {
-      if (err) {
-        console.error('Error writing chunk to file:', err);
-      } else {
-        console.log('Chunk saved');
-      }
-    });
+
+    if (writeStream.writable) {
+      writeStream.write(buffer, (err) => {
+        if (err) {
+          console.error('Error writing chunk to file:', err);
+        } else {
+          console.log('Chunk saved successfully');
+        }
+      });
+    } else {
+      console.error('Cannot write chunk: Write stream is not writable');
+    }
   });
 
   socket.on('process-video', async (data) => {
-   
-    console.log('Processing', data);
-    const openai = new OpenAI({
-      apiKey: data.API_KEY,
-    });
-    // Close the writeStream to ensure all data is flushed
+    console.log('Processing video:', data);
+    const openai = new OpenAI({ apiKey: data.API_KEY });
+
     if (writeStream) {
       writeStream.end();
+      writeStream = null;
     }
 
-    // Wait for the writeStream to finish
-    writeStream.on('finish', async () => {
-      fs.readFile('temp_upload/' + data.filename, async (err, file) => {
-        if (err) {
-          console.error('Error reading file:', err);
-          return;
-        }
+    fs.readFile(`temp_upload/${data.filename}`, async (err, file) => {
+      if (err) {
+        console.error('Error reading file:', err);
+        return;
+      }
 
+      try {
         const processing = await axios.post(
           `${process.env.NEXT_API_HOST}recording/${data.userId}/processing`,
           { filename: data.filename }
         );
-        if (processing.data.status !== 200)
-          return console.log(
-            'Error: Something went wrong with processing the file'
-          );
+
+        if (processing.data.status !== 200) {
+          console.error('Error during processing stage');
+          return;
+        }
 
         const Key = data.filename;
         const Bucket = process.env.BUCKET_NAME;
@@ -97,91 +93,82 @@ io.on('connection', (socket) => {
           ContentType,
           Body: file,
         });
+
         const fileStatus = await s3.send(command);
         if (fileStatus['$metadata'].httpStatusCode === 200) {
-          console.log('Video uploaded to AWS');
+          console.log('Video uploaded to AWS successfully');
+
           if (processing.data.plan === 'PRO') {
-            fs.stat('temp_upload/' + data.filename, async (err, stat) => {
-              if (!err) {
-                if (stat.size < 25000000) {
-                  try{
-                  const transcription =
-                    await openai.audio.transcriptions.create({
-                      file: fs.createReadStream(
-                        `temp_upload/${data.filename}`
-                      ),
-                      model: 'whisper-1',
-                      response_format: 'text',
-                    });
-                  if (transcription) {
-                    const completion =
-                      await openai.chat.completions.create({
-                        model: 'gpt-3.5-turbo',
-                        messages: [
-                          {
-                            role: 'system',
-                            content: `You are going to generate a title and a nice description using the speech to text transcription provided: transcription(${transcription}) and then return it in json format as {"title":<the title you gave>,"summary":<the summary you created>}`,
-                          },
-                        ],
-                      });
-                    console.log(
-                      'gpt->response',
-                      completion.choices[0].message.content
-                    );
-                    console.log(
-                      'gpt->whisper->response',
-                      transcription
-                    );
-                    const titleAndSummary = await axios.post(
-                      `${process.env.NEXT_API_HOST}recording/${data.userId}/transcribe`,
-                      {
-                        filename: data.filename,
-                        content: completion.choices[0].message.content,
-                        transcript: transcription,
-                      }
-                    );
-                    if (titleAndSummary.data.status !== 200) {
-                      console.log(
-                        'Error: Something went wrong when creating the title and description'
-                      );
-                    }
+            const stat = fs.statSync(`temp_upload/${data.filename}`);
+            if (stat.size < 25000000) {
+              try {
+                const transcription = await openai.audio.transcriptions.create({
+                  file: fs.createReadStream(`temp_upload/${data.filename}`),
+                  model: 'whisper-1',
+                  response_format: 'text',
+                });
+
+                const completion = await openai.chat.completions.create({
+                  model: 'gpt-3.5-turbo',
+                  messages: [
+                    {
+                      role: 'system',
+                      content: `Generate a title and description using this transcription: transcription(${transcription}). Return JSON as {"title":<title>, "summary":<summary>}`,
+                    },
+                  ],
+                });
+
+                const titleAndSummary = await axios.post(
+                  `${process.env.NEXT_API_HOST}recording/${data.userId}/transcribe`,
+                  {
+                    filename: data.filename,
+                    content: completion.choices[0].message.content,
+                    transcript: transcription,
                   }
-                }catch(error){
-                  console.log('Error in API_KEY OR transcribing')
+                );
+
+                if (titleAndSummary.data.status !== 200) {
+                  console.error('Error creating title and summary');
                 }
+              } catch (error) {
+                console.error('Error with OpenAI API:');
               }
             }
-            });
           }
+
           const stopProcessing = await axios.post(
             `${process.env.NEXT_API_HOST}recording/${data.userId}/complete`,
-            {
-              filename: data.filename,
-            }
+            { filename: data.filename }
           );
-          if (stopProcessing.data.status !== 200) {
-            console.log(
-              'Error: Something went wrong when stopping the processing stage.'
-            );
-          }
+
           if (stopProcessing.data.status === 200) {
-            fs.unlink('temp_upload/' + data.filename, (err) => {
-              if (!err)
-                console.log(data.filename + ' deleted successfully');
+            fs.unlink(`temp_upload/${data.filename}`, (err) => {
+              if (!err) {
+                console.log(`${data.filename} deleted successfully`);
+              }
             });
+          } else {
+            console.error('Error during stop processing stage');
           }
         } else {
-          console.log('Error: Upload failed, process aborted');
+          console.error('Error: Upload to AWS failed');
         }
-      });
+      } catch (error) {
+        console.error('Error during processing:', error);
+      }
     });
   });
 
-  socket.on('disconnect', async (data) => {
-    console.log('Socket.id is disconnected', socket.id);
+  socket.on('disconnect', () => {
+    console.log('Socket disconnected:', socket.id);
+
+    if (writeStream) {
+      writeStream.end();
+      writeStream = null;
+    }
   });
 });
 
 server.listen(5000, () => {
-  console.log('Listening to port 5000');
+  console.log('Server is listening on port 5000');
 });
